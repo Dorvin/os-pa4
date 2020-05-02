@@ -144,6 +144,8 @@ freeproc(struct proc *p)
   p->xstate = 0;
   p->state = UNUSED;
 #ifdef SNU
+  p->nice = 19;
+  p->counter = 0;
   p->ticks = 0;
 #endif
 }
@@ -203,7 +205,11 @@ userinit(void)
 
   p = allocproc();
   initproc = p;
-  
+#ifdef SNU
+  p->nice = 0;
+  p->counter = ((20-(p->nice)) >> 2) + 1;
+  p->ticks = 0;
+#endif
   // allocate one user page and copy init's instructions
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
@@ -280,6 +286,12 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+#ifdef SNU
+  np->nice = p->nice;
+  np->counter = (p->counter + 1) >> 1;
+  np->ticks = 0;
+  p->counter = p->counter >> 1;
+#endif
 
   np->state = RUNNABLE;
 
@@ -445,8 +457,10 @@ void
 scheduler(void)
 {
   struct proc *p;
+  int good = -1;
+  int max = -1;
+  struct proc *max_p;
   struct cpu *c = mycpu();
-  
   c->proc = 0;
   for(;;){
     // Avoid deadlock by ensuring that devices can interrupt.
@@ -455,19 +469,49 @@ scheduler(void)
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->scheduler, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+        if(p->counter == 0){
+          good = 0;
+        } else {
+          good = p->counter + (20 - p->nice);
+        }
+        if(max < good){
+          max_p = p;
+          max = good;
+        }
       }
       release(&p->lock);
     }
+    // no runnable process
+    if(max == -1){
+      continue;
+    }
+    // counter value of all runnable process are zero, start new epoch
+    if(max == 0){
+      for(p = proc; p < &proc[NPROC]; p++) {
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          p->counter = ((20-(p->nice)) >> 2) + 1;
+        } else if(p->state == SLEEPING){
+          p->counter = (p->counter >> 1) + ((20-(p->nice)) >> 2) + 1;
+        }
+        release(&p->lock);
+      }
+      max = -1;
+      continue;
+    }
+    acquire(&max_p->lock);
+    // Switch to chosen process.  It is the process's job
+    // to release its lock and then reacquire it
+    // before jumping back to us.
+    max_p->state = RUNNING;
+    c->proc = max_p;
+    swtch(&c->scheduler, &max_p->context);
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming back.
+    c->proc = 0;
+    release(&max_p->lock);
+    max = -1;
   }
 }
 
@@ -504,10 +548,21 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
 #ifdef SNU
   p->ticks++;
 #endif
+  if(p->counter == 0){
+    p->state = RUNNABLE;
+    sched();
+    release(&p->lock);
+    return;
+  }
+  p->counter--;
+  if(p->counter > 0){
+    release(&p->lock);
+    return;
+  }
+  p->state = RUNNABLE;
   sched();
   release(&p->lock);
 }
@@ -680,10 +735,48 @@ procdump(void)
 
 #ifdef SNU
 int
+nice(int pid, int inc){
+  struct proc *p;
+  int new_nice = 0;
+  if(pid < 0){
+    return -1;
+  }
+  if(pid == 0){
+    p = myproc();
+    acquire(&p->lock);
+    new_nice = p->nice + inc;
+    if(new_nice < -20 || 19 < new_nice){
+      release(&p->lock);
+      return -1;
+    }
+    p->nice = new_nice;
+    release(&p->lock);
+    return 0;
+  }
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      new_nice = p->nice + inc;
+      if(new_nice < -20 || 19 < new_nice){
+        release(&p->lock);
+        return -1;
+      }
+      p->nice = new_nice;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
+int
 getticks(int pid)
 {
   struct proc *p;
-
+  if(pid < 0){
+    return -1;
+  }
   if (pid == 0)
     return myproc()->ticks;
 
